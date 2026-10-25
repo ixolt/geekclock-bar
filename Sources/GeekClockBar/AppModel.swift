@@ -172,6 +172,7 @@ final class AppModel: ObservableObject {
             if showSignIn { signInWindow.show() }
         case .failure(.failed(let message)):
             lastError = message
+            log.error("Auth check failed: \(message, privacy: .public)")
         }
     }
 
@@ -205,6 +206,7 @@ final class AppModel: ObservableObject {
         case .ok(let data):
             guard let fresh = try? parseUsage(data) else {
                 lastError = "Unexpected response from claude.ai"
+                log.error("Usage response did not parse")
                 return
             }
             usage = usage.merging(fresh, at: Date())
@@ -214,6 +216,7 @@ final class AppModel: ObservableObject {
             markSignedOut()
         case .failed(let message):
             lastError = message
+            log.error("Usage fetch failed: \(message, privacy: .public)")
         }
     }
 

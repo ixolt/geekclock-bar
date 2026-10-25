@@ -2,15 +2,16 @@ import Foundation
 import GeekClockCore
 import WebKit
 
-enum FetchOutcome: Sendable {
-    case ok(Data)
+enum SessionError: LocalizedError, Equatable {
     case signedOut
     case failed(String)
-}
 
-enum SessionError: Error, Equatable {
-    case signedOut
-    case failed(String)
+    var errorDescription: String? {
+        switch self {
+        case .signedOut: "Signed out"
+        case .failed(let message): message
+        }
+    }
 }
 
 /// Safari's user agent, so claude.ai and Cloudflare treat the web views like
@@ -23,18 +24,16 @@ let safariUserAgent =
 /// WebKit keeps that session refreshed for us.
 @MainActor
 final class ClaudeSession {
-    private let webView: WKWebView
-    private var pageReady = false
+    private let page: WebViewPage
+    private let fetcher: ClaudeFetcher
 
     init() {
-        let config = WKWebViewConfiguration()
-        config.websiteDataStore = .default()
-        webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 1, height: 1), configuration: config)
-        webView.customUserAgent = safariUserAgent
+        page = WebViewPage()
+        fetcher = ClaudeFetcher(page: page)
     }
 
     func organizationID() async -> Result<String, SessionError> {
-        switch await get("/api/organizations") {
+        switch await fetcher.get("/api/organizations") {
         case .ok(let data):
             guard let id = parseOrganizationID(data) else { return .failure(.failed("No organization found")) }
             return .success(id)
@@ -46,12 +45,12 @@ final class ClaudeSession {
     }
 
     func usage(orgID: String) async -> FetchOutcome {
-        await get("/api/organizations/\(orgID)/usage")
+        await fetcher.get("/api/organizations/\(orgID)/usage")
     }
 
     /// The account's email address, if claude.ai tells us.
     func accountLabel() async -> String? {
-        guard case .ok(let data) = await get("/api/account"),
+        guard case .ok(let data) = await fetcher.get("/api/account"),
               let account = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
         return account["email_address"] as? String
     }
@@ -63,51 +62,46 @@ final class ClaudeSession {
             $0.displayName.contains("claude.ai") || $0.displayName.contains("anthropic")
         }
         await store.removeData(ofTypes: types, for: records)
-        pageReady = false
+        fetcher.reset()
     }
+}
 
-    private func get(_ path: String) async -> FetchOutcome {
-        if !pageReady {
-            guard await loadHomePage() else { return .failed("claude.ai did not load") }
-        }
-        let script = """
-            const r = await fetch(path, {credentials: 'include', headers: {'accept': 'application/json'}});
-            return {status: r.status, body: await r.text(), url: r.url};
-            """
-        let result: Any?
-        do {
-            result = try await webView.callAsyncJavaScript(script, arguments: ["path": path], contentWorld: .defaultClient)
-        } catch {
-            pageReady = false
-            return .failed(error.localizedDescription)
-        }
-        guard let reply = result as? [String: Any],
-              let status = (reply["status"] as? NSNumber)?.intValue,
-              let body = reply["body"] as? String else {
-            return .failed("Unexpected reply from claude.ai")
-        }
-        let url = reply["url"] as? String ?? ""
-        let isJSON = body.hasPrefix("{") || body.hasPrefix("[")
+/// The off-screen claude.ai page, backed by a WKWebView.
+@MainActor
+private final class WebViewPage: ClaudePage {
+    private let webView: WKWebView
 
-        if status == 200 && isJSON { return .ok(Data(body.utf8)) }
-        if status == 401 || url.contains("/login") || (status == 403 && isJSON && body.contains("\"error\"")) {
-            return .signedOut
-        }
-        // Probably a Cloudflare challenge page: reload claude.ai next time.
-        pageReady = false
-        return .failed("HTTP \(status)")
+    init() {
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = .default()
+        webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 1, height: 1), configuration: config)
+        webView.customUserAgent = safariUserAgent
     }
 
     /// Loads https://claude.ai/ so fetches run on a claude.ai page.
-    private func loadHomePage() async -> Bool {
+    func load() async -> Bool {
         webView.load(URLRequest(url: URL(string: "https://claude.ai/")!))
         for _ in 0..<80 {  // up to 20 s
             try? await Task.sleep(for: .milliseconds(250))
             if !webView.isLoading, webView.url?.host == "claude.ai" {
-                pageReady = true
                 return true
             }
         }
         return false
+    }
+
+    func fetch(_ path: String) async throws -> PageReply {
+        let script = """
+            const r = await fetch(path, {credentials: 'include', headers: {'accept': 'application/json'}});
+            return {status: r.status, body: await r.text(), url: r.url};
+            """
+        let result = try await webView.callAsyncJavaScript(
+            script, arguments: ["path": path], contentWorld: .defaultClient)
+        guard let reply = result as? [String: Any],
+              let status = (reply["status"] as? NSNumber)?.intValue,
+              let body = reply["body"] as? String else {
+            throw SessionError.failed("Unexpected reply from claude.ai")
+        }
+        return PageReply(status: status, body: body, url: reply["url"] as? String ?? "")
     }
 }
